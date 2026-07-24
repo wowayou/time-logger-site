@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<!--
+  时间尺 (time-logger)
+  Copyright © 2026 wowayou — https://github.com/wowayou/time-logger
+  SPDX-License-Identifier: AGPL-3.0-or-later
+  Commercial licensing available on request; contact via the repository above.
+-->
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="时间尺">
+  <!-- P33 感知缓解（v66）：冷孵化进程的 ~1.4s+ 黑屏换成品牌启动图。只做 SE 尺寸
+       （唯一真实设备），其它设备保持系统默认；iOS 只认静态图，动图不存在于此机制。 -->
+  <link rel="apple-touch-startup-image" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)" href="icons/splash-750x1334.png">
+  <meta name="theme-color" content="#0e0f13" id="meta-theme-color">
+  <script>
+    (() => {
+      try {
+        const enabled = new URLSearchParams(location.hash.slice(1)).get('boottrace') === '1';
+        if (enabled) {
+          window.__timelogBootTrace = {
+            marks: [{ name: 'html_inline_start', at: performance.now() }],
+            snapshot: 'pending',
+            snapshotStates: ['pending']
+          };
+        }
+      } catch {}
+      try {
+        const pref = localStorage.getItem('timelog.theme') || 'auto';
+        if (pref === 'light' || pref === 'dark') document.documentElement.setAttribute('data-theme', pref);
+        // Resolve theme-color before paint so light-mode reloads don't flash a dark
+        // status bar (the meta default is dark; applyTheme only runs after the module
+        // loads). auto follows the system preference.
+        const effective = pref === 'auto'
+          ? (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+          : pref;
+        const meta = document.getElementById('meta-theme-color');
+        if (meta) meta.setAttribute('content', effective === 'light' ? '#f6f6f5' : '#0e0f13');
+      } catch {}
+    })();
+  </script>
+  <script>
+    (() => {
+      try {
+        const d = JSON.parse(localStorage.getItem('timelog.v1'));
+        document.documentElement.setAttribute('data-boot', (d && d.entries && d.entries.length) ? 'has-entries' : 'empty');
+      } catch { document.documentElement.setAttribute('data-boot', 'empty'); }
+    })();
+  </script>
+  <script>
+    // v58 Fix A：尽早注册 Service Worker，脱离 ES module 图的加载链路。
+    // app.js 末尾原注册在慢启动时要等整张 12模块图跑完才到达；register 幂等，
+    // app.js 仍负责 updatefound/更新提示，此处只保证注册尽早发生。
+    (() => {
+      try {
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.register('sw.js').catch(() => {});
+        }
+      } catch {}
+    })();
+  </script>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="icons/icon-512.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+  <title>时间尺</title>
+  <link rel="modulepreload" href="src/time.js">
+  <link rel="modulepreload" href="src/stats.js">
+  <link rel="modulepreload" href="src/storage.js">
+  <link rel="modulepreload" href="src/entry_model.js">
+  <link rel="modulepreload" href="src/ui.js">
+  <link rel="modulepreload" href="src/pickers.js">
+  <link rel="modulepreload" href="src/io_actions.js">
+  <link rel="modulepreload" href="src/sheet_controller.js">
+  <link rel="modulepreload" href="src/app.js">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <div class="hdr">
+    <div class="hdr-brand">
+      <a href="https://github.com/wowayou/time-logger" target="_blank" rel="noopener" class="hdr-icon-link" aria-label="时间尺 GitHub 仓库">
+        <img src="icon.svg" alt="时间尺" class="hdr-icon" width="32" height="32">
+      </a>
+      <div class="hdr-brand-copy">
+        <h1 class="hdr-title">时间尺</h1>
+        <span class="usage-day" id="usage-day" hidden></span>
+      </div>
+    </div>
+    <div class="hdr-actions">
+      <button class="hdr-action-btn" type="button" data-action="open-more" data-tip="更多：摘要、备份、标签设置、主题、说明。" data-tip-pos="bottom" aria-label="打开更多菜单">···</button>
+    </div>
+  </div>
+
+  <div class="view-box">
+    <div class="seg view-tabs" id="view-tabs" role="group" aria-label="视图">
+      <button type="button" data-action="view" data-view="day" data-tip="查看单日时间轴，可编辑记录。" data-tip-pos="bottom" aria-label="天视图">天</button>
+      <button type="button" data-action="view" data-view="week" data-tip="查看本周每日汇总，可下钻到某天。" data-tip-pos="bottom" aria-label="周视图">周</button>
+      <button type="button" data-action="view" data-view="month" data-tip="查看本月每日汇总，可下钻到某天。" data-tip-pos="bottom" aria-label="月视图">月</button>
+      <button type="button" data-action="view" data-view="year" data-tip="查看全年每月汇总，可下钻到某月。" data-tip-pos="bottom" aria-label="年视图">年</button>
+    </div>
+    <div class="date-nav">
+      <button class="nav-btn" type="button" data-action="shift-period" data-delta="-1" aria-label="上一段" data-tip="切到上一段。">‹</button>
+      <div class="period-label" id="period-label"></div>
+      <button class="nav-btn" type="button" data-action="shift-period" data-delta="1" aria-label="下一段" data-tip="切到下一段。">›</button>
+      <button class="nav-btn" id="today-btn" type="button" data-action="today" data-tip="回到包含今天的当前周期。" aria-label="回到今天">回到今天</button>
+    </div>
+  </div>
+
+  <div class="ruler" id="ruler">
+    <div class="ruler-bar"></div>
+  </div>
+
+  <!-- v69 阶段格言（C13）：静态壳保持空 + hidden，由 JS 按三态填充（同 #usage-day
+       的纪律，不得写死任何文案）。点击打开编辑 sheet。 -->
+  <button class="motto-line" id="motto-line" type="button" data-action="open-motto" hidden></button>
+
+  <div>
+    <div class="tl-head">
+      <div class="tl-label" id="list-label">当日时间轴</div>
+    </div>
+    <div id="timeline"></div>
+  </div>
+</div>
+
+<!-- R2+FAB（v47）：入口合并为右下角悬浮「记一条」（原嵌入横条 + 切换活动）。保留
+     id=add-btn（启动门闩/测试引用）。副文案由 renderChrome 按续记起点动态填。 -->
+<button class="fab" id="add-btn" type="button" data-action="open-form" hidden aria-label="记一条新的时间记录">
+  <span class="fab-main">＋ 记一条</span>
+  <span class="fab-sub" data-role="fab-sub"></span>
+</button>
+<div class="list-fade" id="list-fade" aria-hidden="true" hidden></div>
+
+<script>
+  (() => {
+    // Safari 刷新时会先绘制静态 HTML 壳，再等待 ES module 恢复真实内容，造成一帧
+    // 「主内容消失 / 回到今天误出现」。同标签页只保存已安全渲染的 DOM 快照，在模块
+    // 到达前接住上一帧；sessionStorage 不跨标签、不上传，也不替代权威数据。
+    try {
+      const trace = window.__timelogBootTrace;
+      const setSnapshotState = state => {
+        if (!trace) return;
+        trace.snapshot = state;
+        trace.snapshotStates.push(state);
+      };
+      const snapshot = JSON.parse(sessionStorage.getItem('timelog.bootSnapshot.v1'));
+      if (!snapshot || typeof snapshot.appHtml !== 'string') {
+        setSnapshotState('no-snapshot');
+        return;
+      }
+      const now = new Date();
+      const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      if (snapshot.dataRaw !== localStorage.getItem('timelog.v1')
+        || snapshot.configRaw !== localStorage.getItem('timelog.config')) {
+        setSnapshotState('rejected:data');
+        return;
+      }
+      if (snapshot.today !== today) {
+        setSnapshotState('rejected:date');
+        return;
+      }
+      if (snapshot.view !== localStorage.getItem('timelog.view')
+        || snapshot.selectedDate !== localStorage.getItem('timelog.selectedDate')
+        || snapshot.recordMode !== localStorage.getItem('timelog.recordMode')) {
+        setSnapshotState('rejected:state');
+        return;
+      }
+      const app = document.querySelector('.app');
+      const addBtn = document.getElementById('add-btn');
+      const listFade = document.getElementById('list-fade');
+      if (!app || !addBtn) return;
+      app.innerHTML = snapshot.appHtml;
+      if (typeof snapshot.addHtml === 'string') addBtn.innerHTML = snapshot.addHtml;
+      addBtn.hidden = Boolean(snapshot.addHidden);
+      if (snapshot.addAria) addBtn.setAttribute('aria-label', snapshot.addAria);
+      if (listFade) listFade.hidden = Boolean(snapshot.fadeHidden);
+      document.body.classList.add('boot-restored');
+      window.__timelogBootRestored = true;
+      setSnapshotState('dom-restored');
+    } catch {
+      if (window.__timelogBootTrace) {
+        window.__timelogBootTrace.snapshot = 'rejected:invalid';
+        window.__timelogBootTrace.snapshotStates.push('rejected:invalid');
+      }
+    }
+  })();
+</script>
+
+<div class="update-banner" id="update-banner" hidden>
+  <span data-role="update-prompt">发现新版。当前数据仍保存在本机。</span>
+  <button class="update-btn" type="button" data-action="update-app" data-tip="刷新并加载新版应用。" aria-label="更新应用">更新应用</button>
+  <span data-role="update-stuck" hidden>没生效？完全退出应用（Safari 关闭本站全部标签页）后重新打开即可完成更新，数据不受影响。</span>
+  <button class="update-btn" type="button" data-action="dismiss-update-banner" hidden aria-label="知道了，稍后完全退出后重开">知道了</button>
+</div>
+
+<div class="cross-tab-banner" id="cross-tab-banner" hidden>
+  <span>另一标签页已修改数据，关闭当前表单后将自动同步。</span>
+  <button class="update-btn" type="button" data-action="dismiss-cross-tab-banner" aria-label="关闭跨标签提示">已知晓</button>
+</div>
+
+<div class="undo-toast" id="undo-toast" role="status" aria-live="polite" hidden>
+  <span data-role="undo-message">已删除</span>
+  <button class="undo-btn" type="button" data-action="undo-delete">撤销</button>
+</div>
+
+<div class="form-sheet" id="form-sheet" hidden>
+  <div class="form-sheet-backdrop" data-action="close-form" aria-hidden="true"></div>
+  <section class="form-sheet-panel" role="dialog" aria-modal="true" aria-labelledby="form-sheet-title"></section>
+</div>
+
+<input class="import-file" type="file" id="import-file" accept="application/json">
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
