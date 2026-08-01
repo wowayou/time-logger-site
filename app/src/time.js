@@ -2,6 +2,8 @@
 // Copyright © 2026 wowayou — https://github.com/wowayou/time-logger
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Commercial licensing available on request; contact via the repository above.
+import { getLocale, t, tList } from './i18n.js';
+
 export function p2(n) {
   return String(n).padStart(2, '0');
 }
@@ -86,7 +88,19 @@ export function minsBetweenDates(a, b) {
   return Math.max(0, (b - a) / 60000);
 }
 
+// SPEC-014 §3: the zh path below is byte-for-byte the pre-existing behavior
+// (never touched) — the en branch is a separate early return, so switching
+// locales cannot change a single byte of zh output.
+function fmtMinsEn(m) {
+  if (m < 1) return '<1m';
+  if (m < 60) return `${Math.round(m)}m`;
+  const h = Math.floor(m / 60);
+  const rem = Math.round(m % 60);
+  return rem ? `${h}h ${rem}m` : `${h}h`;
+}
+
 export function fmtMins(m) {
+  if (getLocale() === 'en') return fmtMinsEn(m);
   if (m < 1) return '<1min';
   if (m < 60) return `~${Math.round(m)}min`;
   const h = Math.floor(m / 60);
@@ -95,6 +109,7 @@ export function fmtMins(m) {
 }
 
 export function fmtPlainMins(m) {
+  if (getLocale() === 'en') return m > 0 ? fmtMinsEn(m) : '0m';
   return m > 0 ? fmtMins(m) : '0min';
 }
 
@@ -118,8 +133,8 @@ export function normalizeTimestamp(raw) {
 
 export function validateTs(raw) {
   const ts = normalizeTimestamp(raw);
-  if (!ts) return { ok: false, msg: '请输入完整日期和时间，例如 2026-06-28 09:05。' };
-  if (new Date(ts) > new Date(Date.now() + 5 * 60000)) return { ok: false, msg: '不能记录明显未来的时间。' };
+  if (!ts) return { ok: false, msg: t('validate.needFullDateTime') };
+  if (new Date(ts) > new Date(Date.now() + 5 * 60000)) return { ok: false, msg: t('validate.noFarFuture') };
   return { ok: true, ts };
 }
 
@@ -162,13 +177,13 @@ export function defaultPlannedTimestamp(dateKey, now = new Date()) {
 
 function validatePlannedTs(raw, opts = {}) {
   const ts = normalizeTimestamp(raw);
-  if (!ts) return { ok: false, msg: '请输入完整日期和时间，例如 2026-06-28 09:05。' };
+  if (!ts) return { ok: false, msg: t('validate.needFullDateTime') };
   const when = new Date(ts);
   const window = planningWindow(opts.now);
   if (when <= window.minExclusive) {
-    return { ok: false, msg: '计划时间必须严格晚于现在 5 分钟。' };
+    return { ok: false, msg: t('validate.planTooSoon') };
   }
-  if (when >= window.maxExclusive) return { ok: false, msg: '计划时间最远可到第 7 天 23:59。' };
+  if (when >= window.maxExclusive) return { ok: false, msg: t('validate.planTooFar') };
   return { ok: true, ts };
 }
 
@@ -182,17 +197,38 @@ export function fmtTs(ts) {
   return value ? value.replace('T', ' ') : String(ts || '');
 }
 
+function weekdayNarrow(d) {
+  return tList('date.weekdayNarrow')[d.getDay()] || '';
+}
+
+// SPEC-014 §3: the only locale-branching date formatting in the app. The zh
+// path is the pre-existing hand-written format, untouched byte-for-byte; en
+// uses Intl.DateTimeFormat('en-US', …) with no `timeZone` option — the Date
+// objects here are already local-wall-clock values, and passing a timeZone
+// would introduce the timezone conversion CLAUDE.md forbids.
 function dateLabel(d) {
-  return `${d.getFullYear()}/${p2(d.getMonth() + 1)}/${p2(d.getDate())} 周${'日一二三四五六'[d.getDay()]}`;
+  if (getLocale() === 'en') {
+    return new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric' }).format(d);
+  }
+  return t('date.full', {
+    y: d.getFullYear(), m: p2(d.getMonth() + 1), d: p2(d.getDate()), wd: weekdayNarrow(d)
+  });
 }
 
 export function shortDateLabel(d) {
-  return `${d.getMonth() + 1}/${d.getDate()} 周${'日一二三四五六'[d.getDay()]}`;
+  if (getLocale() === 'en') {
+    return new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'numeric', day: 'numeric' }).format(d);
+  }
+  return t('date.short', { m: d.getMonth() + 1, d: d.getDate(), wd: weekdayNarrow(d) });
 }
 
 function shortRangeLabel(start, end) {
   const last = addDays(end, -1);
   return `${p2(start.getMonth() + 1)}/${p2(start.getDate())}-${p2(last.getMonth() + 1)}/${p2(last.getDate())}`;
+}
+
+function enMonthDay(d) {
+  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(d);
 }
 
 export function periodRange(view, dateKey) {
@@ -216,8 +252,17 @@ export function periodRange(view, dateKey) {
 export function periodLabel(view, dateKey, opts = {}) {
   const { start, end } = periodRange(view, dateKey);
   const last = addDays(end, -1);
+  const isEn = getLocale() === 'en';
   if (view === 'day') return dateLabel(start);
-  if (view === 'week') return opts.short ? shortRangeLabel(start, end) : `${dateLabel(start)} - ${p2(last.getMonth() + 1)}/${p2(last.getDate())}`;
-  if (view === 'month') return `${start.getFullYear()}年${start.getMonth() + 1}月`;
-  return `${start.getFullYear()}年`;
+  if (view === 'week') {
+    if (opts.short) return shortRangeLabel(start, end);
+    if (isEn) return `${enMonthDay(start)} – ${enMonthDay(last)}`;
+    return `${dateLabel(start)} - ${p2(last.getMonth() + 1)}/${p2(last.getDate())}`;
+  }
+  if (view === 'month') {
+    if (isEn) return new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(start);
+    return t('date.monthLabel', { y: start.getFullYear(), m: start.getMonth() + 1 });
+  }
+  if (isEn) return String(start.getFullYear());
+  return t('date.yearLabel', { y: start.getFullYear() });
 }
