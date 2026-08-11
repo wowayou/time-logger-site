@@ -127,9 +127,15 @@ export function resolveMotto(config = loadConfig()) {
 // `getLocale()` 读一次当前语言，不写 locale、不订阅语言变化、也不在
 // mainlineSource/chipsSource 的「已有 raw 但字段缺失」兜底分支之外被使用。
 // 英文种子与中文种子一一对应（睡觉→Sleep、吃饭→Meals……），`longOk` 逐项一致。
+// v89：主线种子必须是**中性占位**，不能是维护者自己的目标。此前 zh 种子是
+// 「求职推进」、en 是「Job search」——那是本项目作者当时的处境，不是产品语义。
+// 对外定位（D13 锁定、主页照此）是目标中立的「5 秒记下真实做了什么」，于是一个
+// 不在找工作的新用户第一次打开表单，唯一那个已经预填好的东西对他是错的，而默认
+// 格言还在旁边说「推进**主线**才是目的」。种子只在全新安装时生效（normalizeConfig
+// 的 raw 为空分支），故**存量用户一个字都不会变**，零迁移。
 const DEFAULT_SEED_BY_LOCALE = {
   zh: {
-    mainline: ['求职推进'],
+    mainline: ['当前主线'],
     chips: [
       { name: '睡觉', bucket: 'maintain', longOk: true },
       { name: '吃饭', bucket: 'maintain', longOk: false },
@@ -143,7 +149,7 @@ const DEFAULT_SEED_BY_LOCALE = {
     ]
   },
   en: {
-    mainline: ['Job search'],
+    mainline: ['Current focus'],
     chips: [
       { name: 'Sleep', bucket: 'maintain', longOk: true },
       { name: 'Meals', bucket: 'maintain', longOk: false },
@@ -206,7 +212,7 @@ function normalizeChip(chip) {
 }
 
 /**
- * 标签配置的形状。`mainlineLongOk` 与 `motto` 都是**可选键**——空集/未设置时
+ * 标签配置的形状。`longReview`、`mainlineLongOk` 与 `motto` 都是**可选键**——关闭/空集/未设置时
  * 根本不写进 localStorage（见 normalizeConfig 里的说明），所以类型上必须是
  * optional 而不是必填。不显式声明的话，tsc 会把 normalizeConfig 的两个 return
  * 分支推成一个联合类型，其中早退分支不含该键，任何 `config.mainlineLongOk`
@@ -214,6 +220,7 @@ function normalizeChip(chip) {
  * @typedef {object} TagConfig
  * @property {number} version
  * @property {string[]} mainline
+ * @property {boolean} [longReview]
  * @property {string[]} [mainlineLongOk]
  * @property {{ name: string, bucket: string, longOk: boolean }[]} chips
  * @property {string} [motto]
@@ -262,6 +269,7 @@ export function normalizeConfig(raw) {
   return {
     version: 1,
     mainline,
+    ...(raw.longReview === true ? { longReview: true } : {}),
     ...(mainlineLongOk.length ? { mainlineLongOk } : {}),
     chips,
     motto: normalizeMotto(raw.motto)
@@ -667,6 +675,9 @@ export function validateImportData(imported) {
         || imported.config.mainlineLongOk.some(name => typeof name !== 'string'))) {
       errors.push(t('import.errConfigMainlineLongOk'));
     }
+    if (imported.config.longReview !== undefined && typeof imported.config.longReview !== 'boolean') {
+      errors.push(t('import.errConfigLongReview'));
+    }
     if (imported.config.motto !== undefined && typeof imported.config.motto !== 'string') {
       errors.push(t('import.errConfigMotto'));
     }
@@ -914,5 +925,14 @@ export function mergeImportedConfig(localConfig, importedConfig) {
   // （normalizeConfig 会再过滤一次）。本机已有的条目不会被备份删掉。
   const mainlineLongOk = [...new Set([...(local.mainlineLongOk || []), ...(imported.mainlineLongOk || [])])];
   const motto = local.motto !== undefined ? local.motto : imported.motto;
-  return normalizeConfig({ version: 1, mainline, mainlineLongOk, chips, motto });
+  // 行为开关始终以本机为准：导入是合并，不应让一份备份在本机静默开启提醒。
+  // 开启过的设备会显式保存 `longReview:true`；关闭态不写键，保持默认关闭与零迁移。
+  return normalizeConfig({
+    version: 1,
+    mainline,
+    ...(local.longReview === true ? { longReview: true } : {}),
+    mainlineLongOk,
+    chips,
+    motto
+  });
 }
