@@ -16,7 +16,7 @@ import {
   planOvernightContinuation,
   planSegmentSplit
 } from './entry_model.js';
-import { isPlaceholderEntry, comparePeriods, periodTrend, primaryTag, recordedDayCount, tagMinutes, formatPercent } from './stats.js';
+import { isPlaceholderEntry, comparePeriods, historyRange, itemRanking, periodBaseline, periodCoverage, periodTrend, scopeActivity, summarizeEntries, primaryTag, recordedDayCount, tagMinutes, formatPercent } from './stats.js';
 import { plural, t } from './i18n.js';
 import {
   BUCKETS,
@@ -50,6 +50,7 @@ import {
   fmtMins,
   fmtPlainMins,
   hhmm,
+  localDateKey,
   localDateTimeKey,
   minsBetweenDates,
   normalizeTimestamp,
@@ -60,7 +61,7 @@ import {
   validateTs,
   validateTsForMode
 } from './time.js';
-import { QUOTE_PACKS, bucketHint, configChipLabel, coverageDaysLabel, entriesCountLabel, quotePackPath, renderConfigRowDraft, renderFormSheet, renderAnalyticsContent, renderTagPicker, renderTagSuggestions } from './ui.js';
+import { QUOTE_PACKS, bucketHint, configChipLabel, coverageDaysLabel, entriesCountLabel, quotePackPath, renderConfigRowDraft, renderFormSheet, renderAnalyticsContent, renderAnalyticsItemsList, renderTagPicker, renderTagSuggestions } from './ui.js';
 
 export function createSheetController(deps) {
   let sheetScrollY = 0;
@@ -104,6 +105,10 @@ export function createSheetController(deps) {
   // v1.8.4：分析的锚定日期＝打开时主视图所看的日期（未来日期退回今天），周/月/年切换
   // 都取包含它的那一期；此前固定今天，翻到上周再打开看到的仍是本周。
   let analyticsAnchor = '';
+  // v1.9.0 事项排行：关键词、是否展开全部、展开日期的事项键。切换期/键时收起，关键词保留。
+  let analyticsQuery = '';
+  let analyticsItemsExpanded = false;
+  let analyticsOpenItemKey = '';
   let analyticsSelectedKey = ANALYTICS_DEFAULT_KEY;
   let analyticsPage = 0;
   let sheetStack = [];
@@ -1069,6 +1074,13 @@ export function createSheetController(deps) {
     });
   }
 
+  // 整层关闭：丢掉二级页返回栈再关。v1.9.0 从时间分析的事项排行跳到某天时用——
+  // 普通 closeForm 会沿栈回到「更多」，主视图虽已切到那天却仍被面板盖住。
+  function closeAllForms() {
+    sheetStack = [];
+    closeForm();
+  }
+
   function registerSheetDismissGesture() {
     const sheet = document.getElementById('form-sheet');
     if (!sheet) return;
@@ -1161,14 +1173,34 @@ export function createSheetController(deps) {
 
   // v1.3.0 拨号盘分析：错开主视图，始终锚定「包含今天的当前周/月/年」。
   // 模型全由 stats.js 纯逻辑算出，config 由这里注入（模块边界不变）。
+  // v1.9.0「全部」：从第一条真实记录到今天，不做对比、趋势与常态，只看总量、事项与累计。
+  function analyticsRange(entries, now) {
+    if (analyticsView === 'all') {
+      const range = historyRange(entries, now);
+      if (range) return range;
+      const today = periodRange('day', todayStr());
+      return today;
+    }
+    return periodRange(analyticsView, analyticsAnchor || todayStr());
+  }
+
   function buildAnalyticsModel() {
     const entries = deps.load().entries;
     const config = deps.loadConfig();
     const view = analyticsView;
     const dateKey = analyticsAnchor || todayStr();
     const now = new Date();
-    const cmp = comparePeriods(entries, view, dateKey, { config, now });
-    const cur = periodRange(view, dateKey);
+    const isAll = view === 'all';
+    const cur = analyticsRange(entries, now);
+    let cmp;
+    if (isAll) {
+      const totals = summarizeEntries(entries, cur.start, cur.end, { config, now });
+      const cov = periodCoverage(entries, cur.start, now < cur.end ? now : cur.end);
+      const zero = { job: 0, maintain: 0, leak: 0, unrecorded: 0 };
+      cmp = { current: totals, coverage: { current: cov }, comparable: false, deltaByBucket: zero, deltaByTag: new Map() };
+    } else {
+      cmp = comparePeriods(entries, view, dateKey, { config, now });
+    }
     const total = cmp.current.job + cmp.current.maintain + cmp.current.leak + cmp.current.unrecorded;
 
     const tagMap = tagMinutes(entries, cur.start, cur.end, { config });
@@ -1185,16 +1217,23 @@ export function createSheetController(deps) {
     const deltaByTag = {};
     cmp.deltaByTag.forEach((v, k) => { deltaByTag[k] = v; });
 
-    // 趋势只对桶算（periodTrend 是桶级的）；选中标签时不给 spark。
-    let trend = null;
-    if (analyticsSelectedKey.startsWith('b:')) {
-      const bucket = analyticsSelectedKey.slice(2);
-      trend = periodTrend(entries, view, dateKey, { config, now, bucket });
-    }
+    const selectedBucket = analyticsSelectedKey.startsWith('b:') ? analyticsSelectedKey.slice(2) : '';
+    const selectedTag = analyticsSelectedKey.startsWith('t:') ? analyticsSelectedKey.slice(2) : '';
+
+    // 趋势与常态（v1.9.0 起桶和标签都有）：范围跟随选中的键。「全部」没有同类周期可比，
+    // 改给累计：这个桶/标签首次、最近出现在哪天，一共出现过几天。
+    const trendScope = selectedBucket ? { bucket: selectedBucket } : { tag: selectedTag };
+    const trend = isAll ? null : periodTrend(entries, view, dateKey, { config, now, ...trendScope });
+    const baseline = isAll ? null : periodBaseline(entries, view, dateKey, { config, now, ...trendScope });
+    const activity = isAll && selectedBucket !== 'unrecorded'
+      ? scopeActivity(entries, cur.start, cur.end, { config, now, ...trendScope })
+      : null;
 
     return {
       view,
-      periodLabel: periodLabel(view, dateKey),
+      periodLabel: isAll
+        ? t('analytics.allLabel', { date: periodLabel('day', localDateKey(cur.start)) })
+        : periodLabel(view, dateKey),
       total,
       buckets: {
         job: cmp.current.job,
@@ -1208,9 +1247,36 @@ export function createSheetController(deps) {
       deltaByTag,
       tags,
       trend,
+      baseline,
+      activity,
       selectedKey: analyticsSelectedKey,
       defaultKey: ANALYTICS_DEFAULT_KEY,
-      page: analyticsPage
+      page: analyticsPage,
+      ...buildAnalyticsItemsModel(entries, config, cur, now)
+    };
+  }
+
+  // 事项排行这一块的模型：有关键词时跨全部桶按正文筛选；否则跟随选中的键，未记录桶
+  // 没有事项。单独成函数是为了输入关键词时只算排行，不重算对比、趋势与常态。
+  function buildAnalyticsItemsModel(entries = deps.load().entries, config = deps.loadConfig(), cur = null, now = new Date()) {
+    if (!cur) cur = analyticsRange(entries, now);
+    const query = analyticsQuery.trim();
+    const selectedBucket = analyticsSelectedKey.startsWith('b:') ? analyticsSelectedKey.slice(2) : '';
+    const selectedTag = analyticsSelectedKey.startsWith('t:') ? analyticsSelectedKey.slice(2) : '';
+    let itemsScopeKind = selectedBucket ? 'bucket' : 'tag';
+    let items = [];
+    if (query) items = itemRanking(entries, cur.start, cur.end, { config, now, query });
+    else if (selectedBucket === 'unrecorded') itemsScopeKind = 'none';
+    else if (selectedBucket) items = itemRanking(entries, cur.start, cur.end, { config, now, bucket: selectedBucket });
+    else items = itemRanking(entries, cur.start, cur.end, { config, now, tag: selectedTag });
+    if (analyticsOpenItemKey && !items.some(item => item.key === analyticsOpenItemKey)) analyticsOpenItemKey = '';
+    return {
+      items,
+      itemsQuery: query,
+      itemsScopeKind,
+      itemsScopeName: selectedBucket ? (BUCKETS[selectedBucket] || '') : `#${selectedTag}`,
+      itemsExpanded: analyticsItemsExpanded,
+      openItemKey: analyticsOpenItemKey
     };
   }
 
@@ -1222,6 +1288,9 @@ export function createSheetController(deps) {
     const today = todayStr();
     const selected = deps.state.selectedDate || today;
     analyticsAnchor = selected > today ? today : selected;
+    analyticsQuery = '';
+    analyticsItemsExpanded = false;
+    analyticsOpenItemKey = '';
     analyticsSelectedKey = ANALYTICS_DEFAULT_KEY;
     analyticsPage = 0;
     openFormSheet({ mode: 'analytics' });
@@ -1236,11 +1305,13 @@ export function createSheetController(deps) {
   }
 
   function analyticsSetPeriod(view) {
-    if (view !== 'week' && view !== 'month' && view !== 'year') return;
+    if (view !== 'week' && view !== 'month' && view !== 'year' && view !== 'all') return;
     if (view === analyticsView) return;
     analyticsView = view;
     analyticsSelectedKey = ANALYTICS_DEFAULT_KEY;
     analyticsPage = 0;
+    analyticsItemsExpanded = false;
+    analyticsOpenItemKey = '';
     refreshAnalytics();
   }
 
@@ -1248,6 +1319,8 @@ export function createSheetController(deps) {
     if (!key) return;
     // 再点选中项 → 回默认主线（与原型同）。
     analyticsSelectedKey = key === analyticsSelectedKey ? ANALYTICS_DEFAULT_KEY : key;
+    analyticsItemsExpanded = false;
+    analyticsOpenItemKey = '';
     refreshAnalytics();
   }
 
@@ -1258,6 +1331,41 @@ export function createSheetController(deps) {
     analyticsPage = n;
     analyticsSelectedKey = ANALYTICS_DEFAULT_KEY;
     refreshAnalytics();
+  }
+
+  // 只重渲事项列表：关键词输入时调用，输入框本身不动，焦点与光标位置保留。
+  function refreshAnalyticsItems() {
+    const panel = document.querySelector('#form-sheet .form-sheet-panel');
+    if (!panel || panel.dataset.mode !== 'analytics') return;
+    const holder = panel.querySelector('[data-role="an-items-list"]');
+    if (holder) holder.innerHTML = renderAnalyticsItemsList(buildAnalyticsItemsModel());
+  }
+
+  function analyticsSetQuery(value) {
+    const next = String(value || '');
+    if (next === analyticsQuery) return;
+    analyticsQuery = next;
+    analyticsItemsExpanded = false;
+    analyticsOpenItemKey = '';
+    refreshAnalyticsItems();
+  }
+
+  function analyticsToggleItems() {
+    analyticsItemsExpanded = !analyticsItemsExpanded;
+    refreshAnalyticsItems();
+  }
+
+  // 点开 / 收起某个多次出现的事项。index 是它在当前排行里的位置（键里含不可放进
+  // HTML 属性的分隔符，故不直接放键）；重渲后把焦点还给同一行。
+  function analyticsToggleItem(index) {
+    const n = Number(index);
+    const model = buildAnalyticsItemsModel();
+    const item = Number.isInteger(n) ? model.items[n] : null;
+    if (!item) return;
+    analyticsOpenItemKey = analyticsOpenItemKey === item.key ? '' : item.key;
+    refreshAnalyticsItems();
+    const row = document.querySelector(`#form-sheet [data-action="analytics-item"][data-index="${n}"]`);
+    if (row) row.focus({ preventScroll: true });
   }
 
   // 本期摘要（「复制本期摘要」键）：本期四桶占比 + Top 标签，纯文本 markdown。
@@ -1312,6 +1420,19 @@ export function createSheetController(deps) {
           name: tag.name,
           bucket: BUCKETS[tag.bucket] || BUCKETS.job,
           dur: fmtPlainMins(tag.mins)
+        }));
+      });
+    }
+    // v1.9.0：附上当前范围（选中的键或关键词）的事项排行前 10，给 AI 复盘更细的素材。
+    if (model.items.length) {
+      const scope = model.itemsQuery ? t('analytics.summaryItemsQuery', { q: model.itemsQuery }) : model.itemsScopeName;
+      lines.push('', t('analytics.summaryItemsHead', { scope }));
+      model.items.slice(0, 10).forEach(item => {
+        lines.push(t('analytics.summaryItemRow', {
+          text: item.text || t('analytics.itemNoText'),
+          tag: item.tag,
+          dur: fmtPlainMins(item.mins),
+          times: item.count > 1 ? ` ${t('analytics.itemCount', { n: item.count })}` : ''
         }));
       });
     }
@@ -2108,6 +2229,7 @@ export function createSheetController(deps) {
     const panel = target && target.closest && target.closest('.form-sheet-panel');
     if (!panel) return;
     if (panel.dataset.mode === 'motto' && target.dataset.role === 'quotes-input') paintQuotesCount(panel);
+    if (panel.dataset.mode === 'analytics' && target.dataset.role === 'an-query') analyticsSetQuery(target.value);
     if (panel.dataset.mode === 'config') {
       if (target.dataset.role === 'cfg-search') filterConfigRows(panel);
       else if (target.closest('.cfg-row')) syncConfigRowFace(target.closest('.cfg-row'));
@@ -3003,6 +3125,9 @@ export function createSheetController(deps) {
     analyticsSetPeriod,
     analyticsPickKey,
     analyticsGoPage,
+    closeAllForms,
+    analyticsToggleItems,
+    analyticsToggleItem,
     copyAnalyticsSummary,
     toggleLongReview,
     openMoreSheet,

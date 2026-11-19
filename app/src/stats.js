@@ -17,7 +17,7 @@ import {
 // SPEC-013：保留标签 id 是数据（config 的键、随备份走），不是文案；显示名在 ui/io 层
 // 映射成 i18n 的 `tag.unknown`。本模块仍不访问 DOM / navigator / localStorage。
 import { RESERVED_UNKNOWN_TAG } from './storage.js';
-import { bucketForTag, longOkForTag, tagKnownForConfirmation } from './storage.js';
+import { bucketForTag, longOkForTag, tagKey, tagKnownForConfirmation } from './storage.js';
 
 export const GAP = 180;
 
@@ -384,6 +384,66 @@ export function tagMinutes(entries, start, end, opts = {}) {
   return map;
 }
 
+// ── v1.9.0 事项排行（时间分析页）──
+// 「事项」＝同一标签下正文相同的记录。正文归并只做最保守的规整：去首尾空白、折叠
+// 连续空白、忽略大小写（与 tagKey 同用 toLowerCase，不随设备语言变）。不做前缀、
+// 关键词或模糊归并——2026-11-18 用维护者真实备份测过（scripts/what_repeat_stats.mjs）：
+// 主线正文多为描述句，前缀归并会把不同任务混在一起，宁可逐条列出。
+export function itemTextKey(what) {
+  return String(what || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/**
+ * 区间内按「标签 + 正文」归并的已发生时长排行，不含未记录段。
+ * opts.bucket 只取该桶；opts.tag 只取该标签（按 tagKey）；opts.query 只取正文含该词的
+ * 记录（同样规整后比较）。每条记录只算一次出现：跨午夜被切成两段仍是一次，日期取它在
+ * 区间内第一段所在的自然日。显示正文与标签取最近一次出现的原文。不修改输入。
+ * @returns {Array<{key:string,text:string,tag:string,bucket:string,mins:number,count:number,occurrences:Array<{date:string,mins:number,count:number}>}>}
+ */
+export function itemRanking(entries, start, end, opts = {}) {
+  const scopeTag = opts.tag != null ? tagKey(opts.tag) : null;
+  const scopeBucket = opts.bucket || null;
+  const query = opts.query ? itemTextKey(opts.query) : '';
+  const perEntry = new Map();
+  buildRangeSegmentsFromEntries(entries, start, end, opts).forEach(seg => {
+    if (seg.unrecorded || !seg.e || seg.mins <= 0) return;
+    if (scopeBucket && seg.bucket !== scopeBucket) return;
+    if (scopeTag !== null && tagKey(seg.tag) !== scopeTag) return;
+    const hit = perEntry.get(seg.e);
+    if (hit) { hit.mins += seg.mins; return; }
+    perEntry.set(seg.e, { entry: seg.e, tag: seg.tag, bucket: seg.bucket, mins: seg.mins, date: localDateKey(seg.start) });
+  });
+  const groups = new Map();
+  perEntry.forEach(item => {
+    const text = typeof item.entry.what === 'string' ? item.entry.what.trim() : '';
+    if (query && !itemTextKey(text).includes(query)) return;
+    const key = `${tagKey(item.tag)}\u0000${itemTextKey(text)}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { key, text, tag: item.tag, bucket: item.bucket, mins: 0, count: 0, days: new Map(), latest: '' };
+      groups.set(key, group);
+    }
+    group.mins += item.mins;
+    group.count += 1;
+    const day = group.days.get(item.date) || { date: item.date, mins: 0, count: 0 };
+    day.mins += item.mins;
+    day.count += 1;
+    group.days.set(item.date, day);
+    if (item.entry.ts >= group.latest) {
+      group.latest = item.entry.ts;
+      group.text = text;
+      group.tag = item.tag;
+    }
+  });
+  const byText = (a, b) => (a.text < b.text ? -1 : a.text > b.text ? 1 : 0);
+  return [...groups.values()]
+    .map(g => ({
+      key: g.key, text: g.text, tag: g.tag, bucket: g.bucket, mins: g.mins, count: g.count,
+      occurrences: [...g.days.values()].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
+    }))
+    .sort((a, b) => (b.mins - a.mins) || (b.count - a.count) || byText(a, b));
+}
+
 function diffTagMaps(curMap, prevMap) {
   const out = new Map();
   const keys = new Set([...curMap.keys(), ...prevMap.keys()]);
@@ -465,12 +525,13 @@ function trailingRun(series, direction) {
  * 某个桶（默认主线 job）在最近若干“已完成”同类周期上的走向。
  * 只用已完成周期（end <= now），当期进行中那期不混入。方向仅由“可比”周期决定，
  * 可比周期少于 MIN_TREND_PERIODS 时返回 insufficient——不编方向。
- * @returns {{ series:number[], comparableSeries:number[], direction:'up'|'down'|'flat'|'insufficient', runLength:number, bucket:string }}
+ * @returns {{ series:number[], comparableSeries:number[], direction:'up'|'down'|'flat'|'insufficient', runLength:number, bucket:string, tag:string|null }}
  */
 export function periodTrend(entries, view, dateKey, opts = {}) {
   const now = opts.now ? new Date(opts.now) : new Date();
   const config = opts.config;
-  const bucket = opts.bucket || 'job';
+  const scope = trendScope(opts);
+  const bucket = scope.bucket || '';
   const periods = opts.periods || COMPARE.TREND_PERIODS;
 
   // 从当期起点往回，逐个取“已完成”周期（end <= now），最多 periods 个，按时间正序。
@@ -479,9 +540,9 @@ export function periodTrend(entries, view, dateKey, opts = {}) {
   for (let i = 0; i < periods; i += 1) {
     const prev = previousPeriodRange(view, ref);
     if (+prev.end > +now) break; // 未完成的不算
-    const totals = summarizeEntries(entries, prev.start, prev.end, { now: prev.end, config });
+    const mins = scopeMinutes(entries, prev.start, prev.end, { now: prev.end, config }, scope);
     const cov = coverageInRange(entries, prev.start, prev.end);
-    collected.unshift({ mins: totals[bucket] || 0, comparable: cov.ratio >= COMPARE.COMPARABLE_COVERAGE });
+    collected.unshift({ mins, comparable: cov.ratio >= COMPARE.COMPARABLE_COVERAGE });
     ref = localDateKey(prev.start);
   }
 
@@ -490,7 +551,101 @@ export function periodTrend(entries, view, dateKey, opts = {}) {
   const direction = comparableSeries.length >= COMPARE.MIN_TREND_PERIODS
     ? classifyDirection(comparableSeries)
     : 'insufficient';
-  return { series, comparableSeries, direction, runLength: trailingRun(comparableSeries, direction), bucket };
+  return { series, comparableSeries, direction, runLength: trailingRun(comparableSeries, direction), bucket, tag: scope.tag != null ? scope.tag : null };
+}
+
+/**
+ * 个人基线（「常态」，v1.9.0）：此前最多 TREND_PERIODS 个已完成同类周期里，与当期
+ * **同样走到这一点**的那一段（当期已完成则整期）各花了多少，取可比那几期的中位数。
+ * 可比＝该段已记录天数 / 该段天数 ≥ COMPARABLE_COVERAGE；可比期少于 MIN_TREND_PERIODS、
+ * 或当期自身记录不足时不下结论。只和上一期比会被一次出差、生病带偏，中位数更稳。
+ * opts.bucket（默认 job）或 opts.tag 指定范围，口径同 periodTrend。
+ * @returns {{ median:number|null, periods:number, current:number, diff:number|null, matched:boolean, verdict:'above'|'below'|'near'|'insufficient' }}
+ */
+export function periodBaseline(entries, view, dateKey, opts = {}) {
+  const now = opts.now ? new Date(opts.now) : new Date();
+  const config = opts.config;
+  const scope = trendScope(opts);
+  const periods = opts.periods || COMPARE.TREND_PERIODS;
+  const cur = periodRange(view, dateKey);
+  const complete = +now >= +cur.end;
+  const curEnd = complete ? cur.end : (now < cur.start ? cur.start : now);
+  const elapsedMs = +curEnd - +cur.start;
+  const current = scopeMinutes(entries, cur.start, cur.end, { now, config }, scope);
+  const currentComparable = elapsedMs > 0
+    && coverageInRange(entries, cur.start, curEnd).ratio >= COMPARE.COMPARABLE_COVERAGE;
+
+  const samples = [];
+  let ref = dateKey;
+  for (let i = 0; i < periods && elapsedMs > 0; i += 1) {
+    const prev = previousPeriodRange(view, ref);
+    ref = localDateKey(prev.start);
+    if (+prev.end > +now) break;
+    // 与 elapsedMatchedRange 同一规则：当期已完成→整期；否则按已过时长平移、不越过该期末。
+    const end = complete ? prev.end : new Date(Math.min(+prev.end, +prev.start + elapsedMs));
+    if (coverageInRange(entries, prev.start, end).ratio < COMPARE.COMPARABLE_COVERAGE) continue;
+    samples.push(scopeMinutes(entries, prev.start, end, { now: end, config }, scope));
+  }
+  if (!currentComparable || samples.length < COMPARE.MIN_TREND_PERIODS) {
+    return { median: null, periods: samples.length, current, diff: null, matched: !complete, verdict: 'insufficient' };
+  }
+  const sorted = [...samples].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  const diff = current - median;
+  const near = Math.abs(diff) < Math.max(COMPARE.FLAT_ABS_MIN, COMPARE.FLAT_REL * median);
+  return { median, periods: samples.length, current, diff, matched: !complete, verdict: near ? 'near' : (diff > 0 ? 'above' : 'below') };
+}
+
+// ── v1.9.0 时间分析「全部」与累计 ──
+// 全部记录的范围：第一条真实记录（非计划、非占位）所在自然日 00:00 到今天结束。
+// 没有真实记录返回 null，调用方不编造范围。
+export function historyRange(entries, now = new Date()) {
+  const first = loggedEntriesFrom(entries).find(entry => !isPlaceholderEntry(entry));
+  if (!first) return null;
+  const start = startOfDay(new Date(first.ts));
+  const end = addDays(startOfDay(new Date(now)), 1);
+  return { start, end: +end > +start ? end : addDays(start, 1) };
+}
+
+// 区间覆盖率（有真实记录的自然日 / 区间已历自然日），供「全部」这类不做对比的范围用。
+export function periodCoverage(entries, start, end) {
+  return coverageInRange(entries, start, end);
+}
+
+/**
+ * 区间内某个桶或标签真正发生过的自然日：首日、末日与天数（只看已发生、非未记录的分段；
+ * 跨午夜的记录两天都算）。opts.bucket / opts.tag 同 periodTrend。
+ * @returns {{ days:number, first:string, last:string }}
+ */
+export function scopeActivity(entries, start, end, opts = {}) {
+  const scope = trendScope(opts);
+  const key = scope.tag != null ? tagKey(scope.tag) : null;
+  const days = new Set();
+  buildRangeSegmentsFromEntries(entries, start, end, opts).forEach(seg => {
+    if (seg.unrecorded || seg.mins <= 0) return;
+    if (key !== null ? tagKey(seg.tag) !== key : seg.bucket !== scope.bucket) return;
+    days.add(localDateKey(seg.start));
+  });
+  const sorted = [...days].sort();
+  return { days: sorted.length, first: sorted[0] || '', last: sorted[sorted.length - 1] || '' };
+}
+
+// 趋势/基线的范围：opts.tag（按 tagKey 匹配）优先，否则 opts.bucket，默认主线桶。
+function trendScope(opts) {
+  return opts.tag != null ? { tag: opts.tag } : { bucket: opts.bucket || 'job' };
+}
+
+function scopeMinutes(entries, start, end, segOpts, scope) {
+  if (scope.tag != null) {
+    const key = tagKey(scope.tag);
+    let mins = 0;
+    buildRangeSegmentsFromEntries(entries, start, end, segOpts).forEach(seg => {
+      if (!seg.unrecorded && seg.mins > 0 && tagKey(seg.tag) === key) mins += seg.mins;
+    });
+    return mins;
+  }
+  return summarizeEntries(entries, start, end, segOpts)[scope.bucket] || 0;
 }
 
 export function confirmSegmentInData(d, id, endTs, opts = {}) {
